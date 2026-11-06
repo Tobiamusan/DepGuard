@@ -1,5 +1,44 @@
 import express from "express"; 
+import { randomUUID } from "node:crypto";
+import Ajv from "ajv";
+import addFormats from "ajv-formats";
+import cyclonedxSchema from "../schemas/bom-1.6.schema.json"
+import spdxSchema from "../schemas/spdx.schema.json";
+import jsfSchema from "../schemas/jsf-0.82.schema.json";
+
+
+const ajv = new Ajv({
+    allErrors: true,
+    strict: false,
+});
+
+addFormats(ajv);
+
+ajv.addSchema(spdxSchema);
+ajv.addSchema(jsfSchema);
+const validateSbom = ajv.compile(cyclonedxSchema);
+
 const app = express();
+
+interface ScanHistoryEntry {
+scanId: string;
+status: string;
+dependencyCount: number;
+createdAt: string;
+policyFindings: string[];
+}
+
+const scanHistory: ScanHistoryEntry[] = [];
+
+interface ScanJob {
+scanId: string;
+status: "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED";
+createdAt: string;
+result?: unknown;
+error?: string;
+}
+
+const scanJobs = new Map<string, ScanJob>();
 
 async function mapWithConcurrency<T, R>(
 items: T[],
@@ -39,6 +78,170 @@ return results;
 const PORT = 3000;
 
 const PACKAGE_AGE_COOLDOWN_DAYS = 7;
+
+interface AllowListEntry {
+name: string;
+version: string;
+reason: string;
+expiresAt: string;
+}
+
+interface SecurityPolicy {
+blockCritical: boolean;
+blockHigh: boolean;
+minimumPackageAgeDays: number;
+allowList: AllowListEntry[];
+}
+
+const defaultPolicy: SecurityPolicy = {
+blockCritical: true,
+blockHigh: true,
+minimumPackageAgeDays: 7,
+allowList: [
+{
+name: "@hapi/pez",
+version: "6.1.3",
+reason: "Approved for the DepGuard allow-list demonstration.",
+expiresAt: "2026-12-05T23:59:59.000Z",
+},
+],
+};
+
+async function evaluatePolicy(
+dependencies: {
+name: string;
+version: string | null;
+packageAgeDays: number | null;
+ageCheckError: string | null;
+warnings: string[];
+vulnerabilities: unknown[];
+}[],
+policy: SecurityPolicy
+) {
+const findings: string[] = [];
+let status: "PASS" | "FAIL" | "ERROR" = "PASS";
+
+for (const dependency of dependencies) {
+const packageName = dependency.name;
+const packageVersion = dependency.version;
+
+const allowed = policy.allowList.some(
+(entry) =>
+entry.name === packageName &&
+entry.version === packageVersion &&
+entry.reason.trim() !== "" &&
+new Date(entry.expiresAt).getTime() > Date.now()
+);
+
+if (allowed) {
+continue;
+}
+
+if (
+policy.minimumPackageAgeDays > 0 &&
+dependency.ageCheckError
+) {
+status = "ERROR";
+findings.push(
+`${packageName}: package age could not be verified.`
+);
+continue;
+}
+
+if (
+policy.minimumPackageAgeDays > 0 &&
+dependency.packageAgeDays !== null &&
+dependency.packageAgeDays < policy.minimumPackageAgeDays
+) {
+if (status !== "ERROR") status = "FAIL";
+
+findings.push(
+`${packageName}: package is younger than ${policy.minimumPackageAgeDays} days.`
+);
+}
+
+if (dependency.warnings.includes("Missing integrity field")) {
+if (status !== "ERROR") status = "FAIL";
+findings.push(`${packageName}: missing integrity field.`);
+}
+
+if (dependency.warnings.includes("Package has an install script")) {
+if (status !== "ERROR") status = "FAIL";
+findings.push(`${packageName}: has an install script.`);
+}
+
+if (
+dependency.warnings.includes(
+"Package uses a non-npm registry source"
+)
+) {
+if (status !== "ERROR") status = "FAIL";
+findings.push(`${packageName}: uses a non-npm registry source.`);
+}
+
+for (const vulnerability of dependency.vulnerabilities) {
+ if (
+ typeof vulnerability !== "object" ||
+ vulnerability === null
+ ) {
+ continue;
+ }
+
+ const vuln = vulnerability as {
+ id?: string;
+ };
+
+ if (!vuln.id) {
+ status = "ERROR";
+ findings.push(
+ `${packageName}: vulnerability ID is missing.`
+ );
+ continue;
+ }
+
+ try {
+ const fullAdvisory = await getOsvAdvisory(vuln.id);
+
+ const advisory = fullAdvisory as {
+ database_specific?: { severity?: string };
+ severity?: { type?: string; score?: string }[];
+ id?: string;
+ };
+
+ const severity = (
+ advisory.database_specific?.severity ?? ""
+ ).toUpperCase();
+
+ if (
+ (severity === "CRITICAL" && policy.blockCritical) ||
+ (severity === "HIGH" && policy.blockHigh)
+ ) {
+ if (status !== "ERROR") status = "FAIL";
+
+ findings.push(
+ `${packageName}: ${severity} vulnerability ${vuln.id}.`
+ );
+ } else if (!severity) {
+ status = "ERROR";
+ findings.push(
+ `${packageName}: severity could not be verified for ${vuln.id}.`
+ );
+ }
+ } catch (error) {
+ status = "ERROR";
+ findings.push(
+ `${packageName}: could not retrieve advisory ${vuln.id}.`
+ );
+ }
+}
+}
+
+return {
+status,
+findings,
+};
+}
+
 const osvCache = new Map<
 string,
 {
@@ -47,7 +250,43 @@ result: unknown;
 }
 >();
 
+const osvAdvisoryCache = new Map<
+string,
+{
+expiresAt: number;
+result: unknown;
+}
+>();
+
+
 const OSV_CACHE_TTL = 24 * 60 * 60 * 1000;
+
+async function getOsvAdvisory(advisoryId: string) {
+ const cached = osvAdvisoryCache.get(advisoryId);
+
+ if (cached && cached.expiresAt > Date.now()) {
+ return cached.result;
+ }
+
+ const response = await fetch(
+ `https://api.osv.dev/v1/vulns/${advisoryId}`
+ );
+
+ if (!response.ok) {
+ throw new Error(
+ `Could not retrieve OSV advisory ${advisoryId}: ${response.status}`
+ );
+ }
+
+ const advisory = await response.json();
+
+ osvAdvisoryCache.set(advisoryId, {
+ expiresAt: Date.now() + OSV_CACHE_TTL,
+ result: advisory,
+ });
+
+ return advisory;
+}
 
 const npmMetadataCache = new Map<
 string,
@@ -405,11 +644,275 @@ const dependenciesWithVulnerabilities = dependencies.map((dependency) => {
  };
 });
 
+const sbomComponents = dependencies.map((dependency) => {
+ const integrity =
+ typeof dependency.integrity === "string"
+ ? dependency.integrity
+ : "";
+
+const hashes = integrity.startsWith("sha512-")
+? [
+{
+alg: "SHA-512",
+content: Buffer.from(
+integrity.replace("sha512-", ""),
+"base64"
+).toString("hex"),
+},
+]
+: [];
+
+ return {
+ type: "library",
+ name: dependency.name,
+ version: dependency.version,
+ purl: `pkg:npm/${dependency.name}@${dependency.version}`,
+ hashes,
+ };
+});
+
+const policyResult = await evaluatePolicy(
+dependenciesWithVulnerabilities,
+defaultPolicy
+);
+
+const sbom = {
+ bomFormat: "CycloneDX",
+ specVersion: "1.6",
+ serialNumber: `urn:uuid:${randomUUID()}`,
+ version: 1,
+ components: sbomComponents,
+};
+
+const isSbomValid = validateSbom(sbom);
+
+const sbomValidationErrors = validateSbom.errors ?? [];
+
+const scanRecord: ScanHistoryEntry = {
+scanId: randomUUID(),
+status: policyResult.status,
+dependencyCount: dependencies.length,
+createdAt: new Date().toISOString(),
+policyFindings: policyResult.findings,
+};
+
+scanHistory.push(scanRecord);
+
 return res.status(200).json({
  message: "Lockfile scanned successfully.",
+ status: policyResult.status,
+ policyFindings: policyResult.findings,
  dependencyCount: dependencies.length,
+ sbomComponents,
+ sbom,
+ sbomValide: isSbomValid,
+ sbomValidationErrors,
  dependencies: dependenciesWithVulnerabilities,
  osvResults,
+});
+});
+
+app.get("/scan-history", (_req, res) => {
+return res.status(200).json({
+totalScans: scanHistory.length,
+scans: scanHistory,
+});
+});
+
+app.post("/scan-async", (req, res) => {
+const scanId = randomUUID();
+
+const scanJob: ScanJob = {
+scanId,
+status: "QUEUED",
+createdAt: new Date().toISOString(),
+};
+
+scanJobs.set(scanId, scanJob);
+
+const lockfile = req.body;
+
+res.status(202).json({
+message: "Scan accepted and queued.",
+scanId,
+status: scanJob.status,
+});
+
+setImmediate(async () => {
+const job = scanJobs.get(scanId);
+
+if (!job) return;
+
+job.status = "RUNNING";
+
+try {
+const scanResponse = await fetch(
+`http://127.0.0.1:${PORT}/scan-lockfile`,
+{
+method: "POST",
+headers: {
+"Content-Type": "application/json",
+},
+body: JSON.stringify(lockfile),
+}
+);
+
+const scanResult = await scanResponse.json();
+
+if (!scanResponse.ok) {
+job.status = "FAILED";
+job.result = scanResult;
+job.error = "Lockfile scan failed.";
+return;
+}
+
+job.status = "COMPLETED";
+job.result = scanResult;
+
+} catch (error) {
+job.status = "FAILED";
+job.error =
+error instanceof Error ? error.message : "Scan failed.";
+}
+});
+});
+
+app.get("/scan-status/:scanId", (req, res) => {
+const { scanId } = req.params;
+
+const job = scanJobs.get(scanId);
+
+if (!job) {
+return res.status(404).json({
+error: "Scan not found.",
+});
+}
+
+return res.status(200).json({
+scanId: job.scanId,
+status: job.status,
+createdAt: job.createdAt,
+});
+});
+
+app.get("/scan-results/:scanId", (req, res) => {
+const { scanId } = req.params;
+
+const job = scanJobs.get(scanId);
+
+if (!job) {
+return res.status(404).json({
+error: "Scan not found.",
+});
+}
+
+if (job.status !== "COMPLETED") {
+return res.status(202).json({
+message: "Scan results are not ready yet.",
+scanId: job.scanId,
+status: job.status,
+});
+}
+
+return res.status(200).json({
+scanId: job.scanId,
+status: job.status,
+result: job.result,
+});
+});
+
+app.post("/scan-diff", (req, res) => {
+const { oldLockfile, newLockfile } = req.body;
+
+const oldValidation = validateLockfileVersion(oldLockfile);
+const newValidation = validateLockfileVersion(newLockfile);
+
+if (!oldValidation.valid || !newValidation.valid) {
+return res.status(400).json({
+error: "Both lockfiles must have supported versions.",
+oldValidation,
+newValidation,
+});
+}
+
+const oldPackages = oldLockfile.packages;
+const newPackages = newLockfile.packages;
+
+if (
+!oldPackages ||
+!newPackages ||
+typeof oldPackages !== "object" ||
+typeof newPackages !== "object" ||
+Array.isArray(oldPackages) ||
+Array.isArray(newPackages)
+) {
+return res.status(400).json({
+error: "Both lockfiles must contain valid packages objects.",
+});
+}
+
+const getDependencies = (packages: Record<string, unknown>) => {
+const dependencyMap = new Map<string, string>();
+
+for (const [path, details] of Object.entries(packages)) {
+if (!path.startsWith("node_modules/")) continue;
+
+const packageInfo = details as Record<string, unknown>;
+
+const version =
+typeof packageInfo.version === "string"
+? packageInfo.version
+: null;
+
+if (version) {
+dependencyMap.set(path, version);
+}
+}
+
+return dependencyMap;
+};
+
+const oldDependencies = getDependencies(oldPackages);
+const newDependencies = getDependencies(newPackages);
+
+const added: Array<{ path: string; version: string }> = [];
+const removed: Array<{ path: string; version: string }> = [];
+const changed: Array<{
+path: string;
+oldVersion: string;
+newVersion: string;
+}> = [];
+
+for (const [path, newVersion] of newDependencies) {
+const oldVersion = oldDependencies.get(path);
+
+if (!oldVersion) {
+added.push({ path, version: newVersion });
+} else if (oldVersion !== newVersion) {
+changed.push({
+path,
+oldVersion,
+newVersion,
+});
+}
+}
+
+for (const [path, oldVersion] of oldDependencies) {
+if (!newDependencies.has(path)) {
+removed.push({ path, version: oldVersion });
+}
+}
+
+return res.status(200).json({
+message: "Lockfile comparison completed.",
+summary: {
+added: added.length,
+removed: removed.length,
+changed: changed.length,
+},
+added,
+removed,
+changed,
 });
 });
 
@@ -440,4 +943,4 @@ error: "An unexpected server error occurred.",
 
 app.listen(PORT, () => {
     console.log(`DepGuard is running on port ${PORT}`);
-});                                                                                                                                                                                                                                          
+});                                                                                                                                                                                                                                         
