@@ -16,7 +16,9 @@ const response = await fetch("http://localhost:3000/scan-lockfile", {
 method: "POST",
 headers: {
 "Content-Type": "application/json",
+"x-account-id": "demo-user-1",
 },
+
 body: JSON.stringify(lockfile),
 });
 

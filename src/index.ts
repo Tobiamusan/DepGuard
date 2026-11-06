@@ -1,10 +1,11 @@
 import express from "express"; 
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHmac, timingSafeEqual,} from "node:crypto";
 import Ajv from "ajv";
 import addFormats from "ajv-formats";
 import cyclonedxSchema from "../schemas/bom-1.6.schema.json"
 import spdxSchema from "../schemas/spdx.schema.json";
 import jsfSchema from "../schemas/jsf-0.82.schema.json";
+import "dotenv/config";
 
 const ajv = new Ajv({
     allErrors: true,
@@ -19,7 +20,7 @@ const validateSbom = ajv.compile(cyclonedxSchema);
 
 const app = express();
 app.use(express.json({
-verify: (req, res, buf) => {
+verify: (req, _res, buf) => {
 (req as express.Request & { rawBody?: Buffer }).rawBody = Buffer.from(buf);
 },
 }));
@@ -33,6 +34,71 @@ policyFindings: string[];
 }
 
 const scanHistory: ScanHistoryEntry[] = [];
+
+interface AccountPlan {
+plan: "free" | "pro";
+scansUsed: number;
+month: string;
+expiresAt: number | null;
+}
+
+const accountPlans = new Map<string, AccountPlan>();
+
+const FREE_SCAN_LIMIT = 30;
+const PRO_SCAN_LIMIT = 1000;
+const PRO_DURATION_DAYS = 30;
+
+function checkScanQuota(accountId: string) {
+const currentMonth = new Date().toISOString().slice(0, 7);
+
+let account = accountPlans.get(accountId);
+
+if (!account) {
+account = {
+plan: "free",
+scansUsed: 0,
+month: currentMonth,
+expiresAt: null,
+};
+}
+
+if (account.month !== currentMonth) {
+account.scansUsed = 0;
+account.month = currentMonth;
+}
+
+if (
+account.plan === "pro" &&
+account.expiresAt !== null &&
+Date.now() > account.expiresAt
+) {
+account.plan = "free";
+account.expiresAt = null;
+}
+
+const limit =
+account.plan === "pro" ? PRO_SCAN_LIMIT : FREE_SCAN_LIMIT;
+
+if (account.scansUsed >= limit) {
+accountPlans.set(accountId, account);
+
+return {
+allowed: false,
+plan: account.plan,
+scansUsed: account.scansUsed,
+limit,
+};
+}
+
+accountPlans.set(accountId, account);
+
+return {
+allowed: true,
+plan: account.plan,
+scansUsed: account.scansUsed,
+limit,
+};
+}
 
 interface ScanJob {
 scanId: string;
@@ -506,6 +572,24 @@ error: "Lockfile must contain a valid packages object.",
 });
 }
 
+const accountId = req.header("x-account-id");
+
+if (!accountId) {
+return res.status(400).json({
+error: "Missing x-account-id header.",
+});
+}
+
+const quota = checkScanQuota(accountId);
+
+if (!quota.allowed) {
+return res.status(402).json({
+error: "Monthly scan quota exceeded.",
+plan: quota.plan,
+scansUsed: quota.scansUsed,
+limit: quota.limit,
+});
+}
 
 // Collect package information without installing or running anything.
 
@@ -701,6 +785,13 @@ policyFindings: policyResult.findings,
 
 scanHistory.push(scanRecord);
 
+const account = accountPlans.get(accountId);
+
+if (account) {
+account.scansUsed += 1;
+accountPlans.set(accountId, account);
+}
+
 return res.status(200).json({
  message: "Lockfile scanned successfully.",
  status: policyResult.status,
@@ -708,10 +799,39 @@ return res.status(200).json({
  dependencyCount: dependencies.length,
  sbomComponents,
  sbom,
- sbomValide: isSbomValid,
+ sbomValid: isSbomValid,
  sbomValidationErrors,
  dependencies: dependenciesWithVulnerabilities,
  osvResults,
+});
+});
+
+app.post("/demo-upgrade", (req, res) => {
+const accountId = req.header("x-account-id");
+
+if (!accountId) {
+return res.status(400).json({
+error: "Missing x-account-id header.",
+});
+}
+
+const currentMonth = new Date().toISOString().slice(0, 7);
+
+const account: AccountPlan = {
+plan: "pro",
+scansUsed: 0,
+month: currentMonth,
+expiresAt: Date.now() + PRO_DURATION_DAYS * 24 * 60 * 60 * 1000,
+};
+
+accountPlans.set(accountId, account);
+
+return res.status(200).json({
+message: "Demo Pro upgrade activated.",
+plan: account.plan,
+scanLimit: PRO_SCAN_LIMIT,
+expiresAt: new Date(account.expiresAt!).toISOString(),
+paymentStatus: "SIMULATED_NOT_PAID",
 });
 });
 
@@ -721,6 +841,8 @@ totalScans: scanHistory.length,
 scans: scanHistory,
 });
 });
+
+
 
 app.post("/scan-async", (req, res) => {
 const scanId = randomUUID();
@@ -895,8 +1017,69 @@ error: "An unexpected server error occurred.",
 });
 
 
+const demoProcessedTransactions = new Set<string>();
+const demoWebhookPayments: Array<{
+transaction_ref: string;
+amount: number;
+status: string;
+}> = [];
 
+app.post("/demo-webhook", (req, res) => {
+const signature = req.header("x-demo-signature");
+const rawBody = (req as express.Request & { rawBody?: Buffer }).rawBody;
+const secret = process.env.WEBHOOK_DEMO_SECRET;
 
+if (!signature || !rawBody || !secret) {
+return res.status(400).json({
+error: "Missing signature, request body, or secret.",
+});
+}
+
+const expectedSignature = createHmac("sha256", secret)
+.update(rawBody)
+.digest("hex");
+
+const received = Buffer.from(signature, "hex");
+const expected = Buffer.from(expectedSignature, "hex");
+
+if (
+received.length !== expected.length ||
+!timingSafeEqual(received, expected)
+) {
+return res.status(401).json({
+error: "Invalid webhook signature. Request rejected.",
+});
+}
+
+const { transaction_ref, amount, status } = req.body;
+
+if (!transaction_ref || !amount || !status) {
+return res.status(400).json({
+error: "Invalid payment notification.",
+});
+}
+
+if (demoProcessedTransactions.has(transaction_ref)) {
+return res.status(200).json({
+message: "Duplicate webhook ignored.",
+processed: false,
+});
+}
+
+demoProcessedTransactions.add(transaction_ref);
+
+demoWebhookPayments.push({
+transaction_ref,
+amount,
+status,
+});
+
+return res.status(200).json({
+message: "Webhook processed successfully.",
+processed: true,
+totalPaymentsRecorded: demoWebhookPayments.length,
+});
+});
 
 app.listen(PORT, () => {
     console.log(`DepGuard is running on port ${PORT}`);
