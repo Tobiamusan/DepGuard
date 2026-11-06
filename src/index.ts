@@ -6,7 +6,6 @@ import cyclonedxSchema from "../schemas/bom-1.6.schema.json"
 import spdxSchema from "../schemas/spdx.schema.json";
 import jsfSchema from "../schemas/jsf-0.82.schema.json";
 
-
 const ajv = new Ajv({
     allErrors: true,
     strict: false,
@@ -19,6 +18,11 @@ ajv.addSchema(jsfSchema);
 const validateSbom = ajv.compile(cyclonedxSchema);
 
 const app = express();
+app.use(express.json({
+verify: (req, res, buf) => {
+(req as express.Request & { rawBody?: Buffer }).rawBody = Buffer.from(buf);
+},
+}));
 
 interface ScanHistoryEntry {
 scanId: string;
@@ -145,7 +149,6 @@ status = "ERROR";
 findings.push(
 `${packageName}: package age could not be verified.`
 );
-continue;
 }
 
 if (
@@ -822,98 +825,49 @@ result: job.result,
 });
 
 app.post("/scan-diff", (req, res) => {
-const { oldLockfile, newLockfile } = req.body;
+ const { oldLockfile, newLockfile } = req.body;
 
-const oldValidation = validateLockfileVersion(oldLockfile);
-const newValidation = validateLockfileVersion(newLockfile);
+ if (!oldLockfile || !newLockfile) {
+ return res.status(400).json({
+ error: "Both oldLockfile and newLockfile are required.",
+ });
+ }
 
-if (!oldValidation.valid || !newValidation.valid) {
-return res.status(400).json({
-error: "Both lockfiles must have supported versions.",
-oldValidation,
-newValidation,
-});
-}
+ const oldPackages = oldLockfile.packages ?? {};
+ const newPackages = newLockfile.packages ?? {};
 
-const oldPackages = oldLockfile.packages;
-const newPackages = newLockfile.packages;
+ const added: string[] = [];
+ const removed: string[] = [];
+ const changed: string[] = [];
 
-if (
-!oldPackages ||
-!newPackages ||
-typeof oldPackages !== "object" ||
-typeof newPackages !== "object" ||
-Array.isArray(oldPackages) ||
-Array.isArray(newPackages)
-) {
-return res.status(400).json({
-error: "Both lockfiles must contain valid packages objects.",
-});
-}
+ for (const [name, newPackage] of Object.entries(newPackages)) {
+ if (!(name in oldPackages)) {
+ added.push(name || "root");
+ } else {
+ const oldPackage = oldPackages[name];
 
-const getDependencies = (packages: Record<string, unknown>) => {
-const dependencyMap = new Map<string, string>();
+ if (oldPackage.version !== (newPackage as any).version) {
+ changed.push(name || "root");
+ }
+ }
+ }
 
-for (const [path, details] of Object.entries(packages)) {
-if (!path.startsWith("node_modules/")) continue;
+ for (const name of Object.keys(oldPackages)) {
+ if (!(name in newPackages)) {
+ removed.push(name || "root");
+ }
+ }
 
-const packageInfo = details as Record<string, unknown>;
-
-const version =
-typeof packageInfo.version === "string"
-? packageInfo.version
-: null;
-
-if (version) {
-dependencyMap.set(path, version);
-}
-}
-
-return dependencyMap;
-};
-
-const oldDependencies = getDependencies(oldPackages);
-const newDependencies = getDependencies(newPackages);
-
-const added: Array<{ path: string; version: string }> = [];
-const removed: Array<{ path: string; version: string }> = [];
-const changed: Array<{
-path: string;
-oldVersion: string;
-newVersion: string;
-}> = [];
-
-for (const [path, newVersion] of newDependencies) {
-const oldVersion = oldDependencies.get(path);
-
-if (!oldVersion) {
-added.push({ path, version: newVersion });
-} else if (oldVersion !== newVersion) {
-changed.push({
-path,
-oldVersion,
-newVersion,
-});
-}
-}
-
-for (const [path, oldVersion] of oldDependencies) {
-if (!newDependencies.has(path)) {
-removed.push({ path, version: oldVersion });
-}
-}
-
-return res.status(200).json({
-message: "Lockfile comparison completed.",
-summary: {
-added: added.length,
-removed: removed.length,
-changed: changed.length,
-},
-added,
-removed,
-changed,
-});
+ return res.status(200).json({
+ added,
+ removed,
+ changed,
+ summary: {
+ added: added.length,
+ removed: removed.length,
+ changed: changed.length,
+ },
+ });
 });
 
 app.use((err: any, 
@@ -939,6 +893,9 @@ return res.status(500).json({
 error: "An unexpected server error occurred.",
 });
 });
+
+
+
 
 
 app.listen(PORT, () => {
